@@ -73,6 +73,15 @@ def init_db():
     }
     for k, v in defaults.items():
         cur.execute("INSERT OR IGNORE INTO state (key, value) VALUES (?, ?)", (k, v))
+        
+    # Постоянные подписчики (семейная группа и родители) — сохраняются при любых перезапусках
+    default_subs = [
+        (-5595572014, "Семья: Эрик 👶"),
+        (1985221994, "Андрей")
+    ]
+    for cid, title in default_subs:
+        cur.execute("INSERT OR IGNORE INTO subscribers (chat_id, title) VALUES (?, ?)", (cid, title))
+        
     conn.commit()
     conn.close()
 
@@ -191,7 +200,8 @@ def tg_send_document(chat_id, filename, file_bytes, caption=""):
 
 def broadcast_message(text, exclude_chat_id=None, reply_markup=None):
     for cid in db_get_subscribers():
-        if exclude_chat_id and cid == exclude_chat_id:
+        # Семейную группу (отрицательный ID в Telegram) никогда не исключаем — туда всегда дублируются все события!
+        if exclude_chat_id and cid == exclude_chat_id and cid > 0:
             continue
         msg = {"chat_id": cid, "text": text, "parse_mode": "HTML"}
         if reply_markup:
