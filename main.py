@@ -1,7 +1,10 @@
-import sys, os, time, datetime, json, sqlite3, threading, re
+import sys, os, time, datetime, json, sqlite3, threading, re, io
 import requests
+import openpyxl
+from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.utils import get_column_letter
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
 TOKEN = "9030754644:AAHxX2fIejBORcD15LJTMtmz4QLlXEr9iqk"
 API_URL = f"https://api.telegram.org/bot{TOKEN}/"
@@ -81,6 +84,14 @@ def db_get_subscribers():
     conn.close()
     return rows
 
+def db_get_all_events():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT timestamp, user_name, category, sub_type, value, notes FROM events ORDER BY id ASC")
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
 def db_get_today_summary():
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
@@ -119,6 +130,14 @@ def tg_send(method, data):
         print(f"API Error ({method}): {e}")
         return None
 
+def tg_send_document(chat_id, filename, file_bytes, caption=""):
+    try:
+        files = {"document": (filename, file_bytes, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")}
+        data = {"chat_id": chat_id, "caption": caption, "parse_mode": "HTML"}
+        requests.post(API_URL + "sendDocument", data=data, files=files, timeout=25)
+    except Exception as e:
+        print(f"Error sending document: {e}")
+
 def broadcast_message(text, exclude_chat_id=None, reply_markup=None):
     for cid in db_get_subscribers():
         if exclude_chat_id and cid == exclude_chat_id:
@@ -146,7 +165,6 @@ def format_summary():
     now_str = datetime.datetime.now().strftime("%H:%M, %d.%m.%Y")
     text = f"<b>📊 Статус малыша Эрика на {now_str}:</b>\n\n"
     
-    # Sleep status
     sleep_state = db_get_state("is_sleeping")
     is_sleeping = sleep_state and sleep_state[0] == "1"
     last_sleep = db_get_last_event("sleep")
@@ -157,7 +175,6 @@ def format_summary():
         wake_since = format_time_diff(last_sleep[0]) if last_sleep else "неизвестно"
         text += f"☀️ <b>Сон:</b> Бодрствует (проснулся {wake_since}).\n"
         
-    # Feed status
     last_feed = db_get_last_event("feed")
     if last_feed:
         t_str = last_feed[0].split()[1][:5]
@@ -186,12 +203,52 @@ def format_summary():
     
     return text
 
+def generate_excel_bytes():
+    wb = openpyxl.Workbook()
+    ws1 = wb.active
+    ws1.title = "Журнал событий"
+    headers1 = ["Дата и время", "Категория", "Действие", "Кто отметил", "Значение / Объём", "Примечание"]
+    ws1.append(headers1)
+    
+    header_fill = PatternFill(start_color="3B7A57", end_color="3B7A57", fill_type="solid")
+    header_font = Font(name="Arial", size=11, bold=True, color="FFFFFF")
+    
+    for col_num in range(1, len(headers1) + 1):
+        cell = ws1.cell(row=1, column=col_num)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        
+    category_map = {
+        "feed": "🍼 Кормление",
+        "sleep": "😴 Сон",
+        "diaper": "👶 Подгузник",
+        "care": "💊 Уход и здоровье"
+    }
+    
+    rows = db_get_all_events()
+    for row in rows:
+        ts, uname, cat, sub, val, notes = row
+        cat_title = category_map.get(cat, cat)
+        ws1.append([ts, cat_title, sub, uname, val or "", notes or ""])
+        
+    for col in ws1.columns:
+        max_len = max(len(str(cell.value or '')) for cell in col)
+        col_letter = get_column_letter(col[0].column)
+        ws1.column_dimensions[col_letter].width = max(max_len + 4, 15)
+        
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf.getvalue()
+
 def get_main_keyboard():
     return {
         "keyboard": [
             [{"text": "🍼 Кормление"}, {"text": "😴 Сон"}],
             [{"text": "👶 Подгузник"}, {"text": "💊 Витамин D и Уход"}],
-            [{"text": "📊 Статус и Сводка"}, {"text": "💡 Подсказки"}]
+            [{"text": "📊 Статус и Сводка"}, {"text": "📁 Скачать Excel"}],
+            [{"text": "💡 Подсказки"}]
         ],
         "resize_keyboard": True
     }
@@ -220,7 +277,6 @@ def get_feed_inline():
 def get_sleep_inline():
     sleep_state = db_get_state("is_sleeping")
     is_sleeping = sleep_state and sleep_state[0] == "1"
-    
     if is_sleeping:
         return {
             "inline_keyboard": [
@@ -284,7 +340,7 @@ def handle_callback(cb):
         }
         val_name = val_map.get(data, "Кормление")
         ml_val = data.replace("feed_bottle_", "") if "bottle" in data else ""
-        db_log_event(user["id"], user_name, "feed", data, ml_val)
+        db_log_event(user["id"], user_name, "feed", val_name, ml_val)
         next_t = (datetime.datetime.now() + datetime.timedelta(hours=3)).strftime("%H:%M")
         announcement = f"🍼 <b>{user_name}:</b> {val_name} в {now_time}.\n⏳ Следующее кормление ориентировочно в ~{next_t}."
         broadcast_message(announcement)
@@ -292,18 +348,18 @@ def handle_callback(cb):
 
     elif data == "sleep_start":
         db_set_state("is_sleeping", "1")
-        db_log_event(user["id"], user_name, "sleep", "sleep_start")
+        db_log_event(user["id"], user_name, "sleep", "Уснул")
         announcement = f"😴 <b>{user_name}:</b> Малыш Эрик <b>уснул 💤</b> в {now_time}.\n<i>(Включите белый шум на колонке, чтобы крепче спал)</i>"
         broadcast_message(announcement)
         tg_send("deleteMessage", {"chat_id": chat_id, "message_id": msg_id})
 
     elif data == "sleep_wake":
         db_set_state("is_sleeping", "0")
-        last_sleep = db_get_last_event("sleep", "sleep_start")
+        last_sleep = db_get_last_event("sleep", "Уснул")
         dur_str = ""
         if last_sleep:
             dur_str = f" Поспал <b>{format_time_diff(last_sleep[0]).replace(' назад', '')}</b>."
-        db_log_event(user["id"], user_name, "sleep", "sleep_wake", dur_str)
+        db_log_event(user["id"], user_name, "sleep", "Проснулся", dur_str)
         announcement = f"☀️ <b>{user_name}:</b> Эрик <b>проснулся!</b> в {now_time}.{dur_str}\n<i>Окно бодрствования: до ~{(datetime.datetime.now() + datetime.timedelta(minutes=75)).strftime('%H:%M')}.</i>"
         broadcast_message(announcement)
         tg_send("deleteMessage", {"chat_id": chat_id, "message_id": msg_id})
@@ -315,7 +371,7 @@ def handle_callback(cb):
             "diaper_both": "💧+💩 Смешанный подгузник"
         }
         d_name = diaper_map.get(data, "Подгузник")
-        db_log_event(user["id"], user_name, "diaper", data)
+        db_log_event(user["id"], user_name, "diaper", d_name)
         announcement = f"👶 <b>{user_name}:</b> Смена подгузника — {d_name} в {now_time}."
         broadcast_message(announcement)
         tg_send("deleteMessage", {"chat_id": chat_id, "message_id": msg_id})
@@ -328,7 +384,7 @@ def handle_callback(cb):
             "care_temp": "🌡️ Измерили температуру (норма)"
         }
         c_name = care_map.get(data, "Уход")
-        db_log_event(user["id"], user_name, "care", data)
+        db_log_event(user["id"], user_name, "care", c_name)
         announcement = f"💊 <b>{user_name}:</b> {c_name} в {now_time}."
         broadcast_message(announcement)
         tg_send("deleteMessage", {"chat_id": chat_id, "message_id": msg_id})
@@ -350,8 +406,8 @@ def handle_message(msg):
             f"Все отметки моментально синхронизируются и видны вам обоим на iPhone 14 Pro Max!\n\n"
             f"<b>Как пользоваться:</b>\n"
             f"• Нажимайте кнопки внизу для быстрого выбора.\n"
-            f"• Добавьте этого бота в семейную группу с супругой — и все уведомления будут приходить в общий чат!\n"
-            f"• В любой момент жмите <b>📊 Статус</b>, чтобы узнать, когда Эрик ел или спал."
+            f"• В любой момент жмите <b>📁 Скачать Excel</b>, чтобы выгрузить таблицу для врача.\n"
+            f"• Жмите <b>📊 Статус</b>, чтобы узнать, когда Эрик ел или спал."
         )
         tg_send("sendMessage", {
             "chat_id": chat_id,
@@ -397,6 +453,14 @@ def handle_message(msg):
             "text": summary,
             "parse_mode": "HTML"
         })
+    elif text == "📁 Скачать Excel":
+        tg_send("sendMessage", {"chat_id": chat_id, "text": "⏳ Формирую Excel-таблицу..."})
+        excel_bytes = generate_excel_bytes()
+        dt_file = datetime.date.today().strftime("%d_%m_%Y")
+        filename = f"Дневник_Эрика_{dt_file}.xlsx"
+        caption = "📊 <b>Актуальный дневник малыша Эрика в Excel</b>\nВы можете открыть его на iPhone или сохранить на Google Диск."
+        tg_send_document(chat_id, filename, excel_bytes, caption)
+
     elif text == "💡 Подсказки":
         tips = (
             "<b>💡 Полезные подсказки для родителей малыша Эрика:</b>\n\n"
@@ -421,29 +485,22 @@ async def alice_webhook(request: Request):
     reply_text = ""
     now_time = datetime.datetime.now().strftime("%H:%M")
 
-    # If new session / empty start
     if session.get("new") and not command:
         reply_text = "Привет! Я Дневник малыша Эрика. Вы можете спросить, когда он ел или спал, либо сказать: 'покормили 120 мл', 'Эрик уснул' или 'Эрик проснулся'."
-    
-    # 1. Сон - проснулся
-    if any(k in command for k in ["проснул", "встал", "проснулась"]):
+    elif any(k in command for k in ["проснул", "встал", "проснулась"]):
         db_set_state("is_sleeping", "0")
-        last_sleep = db_get_last_event("sleep", "sleep_start")
+        last_sleep = db_get_last_event("sleep", "Уснул")
         dur_str = ""
         if last_sleep:
             dur_str = f" Поспал {format_time_diff(last_sleep[0]).replace(' назад', '')}."
-        db_log_event(0, "Алиса (Голос)", "sleep", "sleep_wake", dur_str)
+        db_log_event(0, "Алиса (Голос)", "sleep", "Проснулся", dur_str)
         broadcast_message(f"☀️ <b>Голосовая отметка через Алису:</b> Эрик <b>проснулся!</b> в {now_time}.{dur_str}")
         reply_text = f"Записала! Эрик проснулся.{dur_str}"
-
-    # Сон - уснул
     elif any(k in command for k in ["уснул", "заснул", "спит", "уложить"]):
         db_set_state("is_sleeping", "1")
-        db_log_event(0, "Алиса (Голос)", "sleep", "sleep_start")
+        db_log_event(0, "Алиса (Голос)", "sleep", "Уснул")
         broadcast_message(f"😴 <b>Голосовая отметка через Алису:</b> Эрик <b>уснул 💤</b> в {now_time}.")
         reply_text = "Записала! Спокойного сна малышу Эрику. Включить белый шум?"
-
-    # Вопрос о сне
     elif any(k in command for k in ["спал", "сон"]) and any(k in command for k in ["когда", "сколько", "как"]):
         sleep_state = db_get_state("is_sleeping")
         is_sleeping = sleep_state and sleep_state[0] == "1"
@@ -454,8 +511,6 @@ async def alice_webhook(request: Request):
         else:
             since = format_time_diff(last_sleep[0]) if last_sleep else "недавно"
             reply_text = f"Эрик сейчас бодрствует. Проснулся {since}."
-
-    # 2. Кормление - вопрос
     elif any(k in command for k in ["ел", "кушал", "поел", "кормлен", "еда", "кормили"]) and any(k in command for k in ["когда", "сколько", "во сколько"]):
         last_feed = db_get_last_event("feed")
         if last_feed:
@@ -470,35 +525,26 @@ async def alice_webhook(request: Request):
                 reply_text = f"Последнее кормление было в {t_str} ({diff}){val}."
         else:
             reply_text = "Сегодня кормлений в дневнике пока не отмечено."
-
-    # Кормление - отметка
     elif any(k in command for k in ["покормил", "съел", "выпил", "кормление", "грудь", "поел", "покушал", "бутылочк"]):
         nums = re.findall(r'\d+', command)
         ml_val = nums[0] if nums else "100"
-        db_log_event(0, "Алиса (Голос)", "feed", f"feed_bottle_{ml_val}", ml_val)
+        db_log_event(0, "Алиса (Голос)", "feed", f"Смесь {ml_val} мл", ml_val)
         next_t = (datetime.datetime.now() + datetime.timedelta(hours=3)).strftime("%H:%M")
         broadcast_message(f"🍼 <b>Голосовая отметка через Алису:</b> Кормление {ml_val} мл в {now_time}.\n⏳ Следующее кормление в ~{next_t}.")
         reply_text = f"Записала кормление {ml_val} мл в {now_time}. Следующее кормление примерно в {next_t}."
-
-    # 3. Витамин D
     elif any(k in command for k in ["витамин", "витамин д"]):
-        db_log_event(0, "Алиса (Голос)", "care", "care_vitd")
+        db_log_event(0, "Алиса (Голос)", "care", "Дали Витамин D")
         broadcast_message(f"☀️ <b>Голосовая отметка через Алису:</b> Дали Витамин D в {now_time}.")
         reply_text = "Отлично! Записала прием витамина D."
-
-    # 4. Подгузник
     elif any(k in command for k in ["подгузник", "памперс"]):
-        db_log_event(0, "Алиса (Голос)", "diaper", "diaper_both")
+        db_log_event(0, "Алиса (Голос)", "diaper", "Смена подгузника")
         broadcast_message(f"👶 <b>Голосовая отметка через Алису:</b> Смена подгузника в {now_time}.")
         reply_text = "Записала смену подгузника!"
-
-    # 5. Статус / сводка
     elif any(k in command for k in ["статус", "сводка", "как дела"]):
         rows = db_get_today_summary()
         diapers = [r for r in rows if r[0] == "diaper"]
         bottles_ml = sum(int(r[2]) for r in rows if r[0] == "feed" and str(r[2]).isdigit())
         reply_text = f"Сегодня Эрик сменил {len(diapers)} подгузников, съел {bottles_ml} миллилитров смеси. В дневнике всё зафиксировано!"
-
     else:
         reply_text = "Я могу записать кормление, сон, подгузник или сказать, когда Эрик ел. Что нужно сделать?"
 
@@ -515,6 +561,15 @@ async def alice_webhook(request: Request):
 def health():
     return {"status": "ok", "app": "ErikBabyTracker", "time": datetime.datetime.now().isoformat()}
 
+@app.get("/export.xlsx")
+def export_excel():
+    excel_bytes = generate_excel_bytes()
+    return Response(
+        content=excel_bytes,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": "attachment; filename=erik_baby_tracker.xlsx"}
+    )
+
 def tg_polling_worker():
     offset = 0
     while True:
@@ -528,7 +583,7 @@ def tg_polling_worker():
                     elif "callback_query" in upd:
                         handle_callback(upd["callback_query"])
             time.sleep(0.5)
-        except Exception as e:
+        except Exception:
             time.sleep(5)
 
 def reminder_worker():
