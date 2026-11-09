@@ -14,6 +14,16 @@ DB_PATH = os.path.join(os.path.dirname(__file__), "erik_tracker.db")
 
 app = FastAPI(title="Erik Baby Tracker & Alice Skill")
 
+MSK_TZ = datetime.timezone(datetime.timedelta(hours=3), name="MSK")
+
+def msk_now():
+    """Возвращает актуальное Московское время (UTC+3) даже на серверах Render в США/Европе."""
+    return datetime.datetime.now(datetime.timezone.utc).astimezone(MSK_TZ).replace(tzinfo=None)
+
+def msk_today():
+    """Текущая дата по Московскому времени."""
+    return msk_now().date()
+
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
@@ -86,8 +96,8 @@ def db_log_event(user_id, user_name, category, sub_type, value="", notes=""):
     cur = conn.cursor()
     cur.execute("""
         INSERT INTO events (timestamp, user_id, user_name, category, sub_type, value, notes)
-        VALUES (datetime('now', 'localtime'), ?, ?, ?, ?, ?, ?)
-    """, (user_id, user_name, category, sub_type, value, notes))
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (msk_now().strftime("%Y-%m-%d %H:%M:%S"), user_id, user_name, category, sub_type, value, notes))
     conn.commit()
     conn.close()
 
@@ -96,8 +106,8 @@ def db_log_memory(user_name, original_text, highlights, health_notes, raw_ai_sum
     cur = conn.cursor()
     cur.execute("""
         INSERT INTO memories (timestamp, user_name, original_text, highlights, health_notes, raw_ai_summary)
-        VALUES (datetime('now', 'localtime'), ?, ?, ?, ?, ?)
-    """, (user_name, original_text, highlights, health_notes, raw_ai_summary))
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (msk_now().strftime("%Y-%m-%d %H:%M:%S"), user_name, original_text, highlights, health_notes, raw_ai_summary))
     conn.commit()
     conn.close()
 
@@ -135,12 +145,13 @@ def db_get_all_events():
 def db_get_today_summary():
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
+    today_str = msk_today().isoformat()
     cur.execute("""
         SELECT category, sub_type, value, timestamp 
         FROM events 
-        WHERE date(timestamp) = date('now', 'localtime')
+        WHERE date(timestamp) = ?
         ORDER BY timestamp ASC
-    """)
+    """, (today_str,))
     rows = cur.fetchall()
     conn.close()
     return rows
@@ -190,7 +201,7 @@ def broadcast_message(text, exclude_chat_id=None, reply_markup=None):
 def format_time_diff(dt_str):
     try:
         t = datetime.datetime.fromisoformat(dt_str)
-        now = datetime.datetime.now()
+        now = msk_now()
         diff = now - t
         total_minutes = int(diff.total_seconds() // 60)
         hours = total_minutes // 60
@@ -203,7 +214,7 @@ def format_time_diff(dt_str):
 
 def get_erik_age_parts(target_date=None):
     if target_date is None:
-        target_date = datetime.date.today()
+        target_date = msk_today()
     birth = datetime.date(2026, 10, 25)
     if target_date < birth:
         return (0, 0, 0)
@@ -240,7 +251,7 @@ def get_erik_age_str(target_date=None):
     return f"{y_str}, {m_str} и {d_str}"
 
 def format_summary():
-    now_str = datetime.datetime.now().strftime("%H:%M, %d.%m.%Y")
+    now_str = msk_now().strftime("%H:%M, %d.%m.%Y")
     age_str = get_erik_age_str()
     text = f"<b>📊 Статус малыша Эрика на {now_str}:</b>\n"
     text += f"👶 <b>Возраст:</b> {age_str} (род. 25.10.2026)\n\n"
@@ -292,7 +303,7 @@ def format_summary():
     text += f"• Витамин D: {'✅ <b>Дали</b>' if vit_d else '❌ <i>Ещё не давали</i>'}\n"
     
     bath_time = (db_get_state("bath_time") or ["20:50"])[0]
-    weekday = datetime.datetime.now().weekday()
+    weekday = msk_now().weekday()
     shampoo_str = "🧴 С шампунем (среда/суббота)" if weekday in [2, 5] else "💧 Без шампуня (тёплая вода)"
     text += f"\n🛁 <b>Купание:</b> ежедневно в {bath_time} ({shampoo_str})."
     
@@ -579,7 +590,7 @@ def handle_callback(cb):
         tg_send("deleteMessage", {"chat_id": chat_id, "message_id": msg_id})
         return
 
-    now_time = datetime.datetime.now().strftime("%H:%M")
+    now_time = msk_now().strftime("%H:%M")
 
     # Settings callbacks
     if data == "menu_set_feed":
@@ -670,7 +681,7 @@ def handle_callback(cb):
     elif data.startswith("tut_feed_"):
         tg_send("deleteMessage", {"chat_id": chat_id, "message_id": msg_id})
         feed_int = float((db_get_state("feed_interval_hours") or ["3.0"])[0])
-        next_t = (datetime.datetime.now() + datetime.timedelta(hours=feed_int)).strftime("%H:%M")
+        next_t = (msk_now() + datetime.timedelta(hours=feed_int)).strftime("%H:%M")
         step2_text = (
             f"🎉 <b>Отлично получилось!</b>\n"
             f"В обычном режиме бот сразу рассчитает время следующего кормления (~{next_t}) "
@@ -763,9 +774,9 @@ def handle_callback(cb):
         db_log_event(user["id"], user_name, "feed", val_name, ml_val)
         
         feed_int = float((db_get_state("feed_interval_hours") or ["3.0"])[0])
-        next_t = (datetime.datetime.now() + datetime.timedelta(hours=feed_int)).strftime("%H:%M")
+        next_t = (msk_now() + datetime.timedelta(hours=feed_int)).strftime("%H:%M")
         
-        now_dt = datetime.datetime.now()
+        now_dt = msk_now()
         today_date_str = str(now_dt.date())
         morning_care_done = db_get_state("morning_care_sent_date")
         morning_care_block = ""
@@ -803,7 +814,7 @@ def handle_callback(cb):
         db_log_event(user["id"], user_name, "sleep", "Проснулся", dur_str)
         
         wake_win = int(float((db_get_state("wake_window_minutes") or ["75"])[0]))
-        target_t = (datetime.datetime.now() + datetime.timedelta(minutes=wake_win)).strftime("%H:%M")
+        target_t = (msk_now() + datetime.timedelta(minutes=wake_win)).strftime("%H:%M")
         
         announcement = (
             f"☀️ <b>{user_name}:</b> Эрик <b>проснулся!</b> в {now_time}.{dur_str}\n"
@@ -944,7 +955,7 @@ def handle_message(msg):
     elif text == "📁 Скачать Excel":
         tg_send("sendMessage", {"chat_id": chat_id, "text": "⏳ Формирую Excel-таблицу..."})
         excel_bytes = generate_excel_bytes()
-        dt_file = datetime.date.today().strftime("%d_%m_%Y")
+        dt_file = msk_today().strftime("%d_%m_%Y")
         filename = f"Дневник_Эрика_{dt_file}.xlsx"
         caption = "📊 <b>Актуальный дневник малыша Эрика в Excel</b>\nСодержит два листа: журнал всех событий и памятные моменты."
         tg_send_document(chat_id, filename, excel_bytes, caption)
@@ -988,11 +999,11 @@ async def alice_webhook(request: Request):
 
     reply_text = ""
     tts_text = None
-    now_time = datetime.datetime.now().strftime("%H:%M")
+    now_time = msk_now().strftime("%H:%M")
 
     # 1. Купание и вечерний уход
     if any(k in command for k in ["купание", "купать", "ванн", "помыть"]):
-        weekday = datetime.datetime.now().weekday()
+        weekday = msk_now().weekday()
         is_shampoo_day = weekday in [2, 5] # Среда = 2, Суббота = 5
         
         shampoo_msg = "Сегодня моем с шампунем (среда или суббота)!" if is_shampoo_day else "Сегодня купаем без шампуня, просто в тёплой воде."
@@ -1081,9 +1092,9 @@ async def alice_webhook(request: Request):
         ml_val = nums[0] if nums else "100"
         db_log_event(0, "Алиса (Голос)", "feed", f"Смесь {ml_val} мл", ml_val)
         feed_int = float((db_get_state("feed_interval_hours") or ["3.0"])[0])
-        next_t = (datetime.datetime.now() + datetime.timedelta(hours=feed_int)).strftime("%H:%M")
+        next_t = (msk_now() + datetime.timedelta(hours=feed_int)).strftime("%H:%M")
         
-        now_dt = datetime.datetime.now()
+        now_dt = msk_now()
         today_date_str = str(now_dt.date())
         morning_care_done = db_get_state("morning_care_sent_date")
         morning_care_block = ""
@@ -1127,7 +1138,7 @@ async def alice_webhook(request: Request):
 
 @app.get("/")
 def health():
-    return {"status": "ok", "app": "ErikBabyTracker", "time": datetime.datetime.now().isoformat()}
+    return {"status": "ok", "app": "ErikBabyTracker", "time": msk_now().isoformat()}
 
 @app.get("/ping")
 def ping():
@@ -1149,11 +1160,11 @@ async def telegram_webhook(request: Request):
 # --- REST API FOR IPHONE WIDGETS & SHORTCUTS (Команды iOS) ---
 @app.get("/api/feed")
 def api_feed(user: str = "Родитель", ml: int = 90, breast: str = ""):
-    now_time = datetime.datetime.now().strftime("%H:%M")
+    now_time = msk_now().strftime("%H:%M")
     val_name = f"🤱 Грудь ({breast})" if breast else f"🍼 Смесь {ml} мл"
     db_log_event(0, f"{user} (Виджет)", "feed", val_name, str(ml) if ml else "")
     feed_int = float((db_get_state("feed_interval_hours") or ["3.0"])[0])
-    next_t = (datetime.datetime.now() + datetime.timedelta(hours=feed_int)).strftime("%H:%M")
+    next_t = (msk_now() + datetime.timedelta(hours=feed_int)).strftime("%H:%M")
     announcement = (
         f"🍼 <b>Виджет iPhone ({user}):</b> {val_name} в {now_time}.\n"
         f"⏳ Следующее кормление ориентировочно в ~{next_t}."
@@ -1163,7 +1174,7 @@ def api_feed(user: str = "Родитель", ml: int = 90, breast: str = ""):
 
 @app.get("/api/sleep")
 def api_sleep(user: str = "Родитель", action: str = "toggle"):
-    now_time = datetime.datetime.now().strftime("%H:%M")
+    now_time = msk_now().strftime("%H:%M")
     sleep_state = db_get_state("is_sleeping")
     is_sleeping = sleep_state and sleep_state[0] == "1"
     if action == "wake" or (action == "toggle" and is_sleeping):
@@ -1181,7 +1192,7 @@ def api_sleep(user: str = "Родитель", action: str = "toggle"):
 
 @app.get("/api/diaper")
 def api_diaper(user: str = "Родитель", type: str = "wet"):
-    now_time = datetime.datetime.now().strftime("%H:%M")
+    now_time = msk_now().strftime("%H:%M")
     d_name = "💧 Мокрый" if type == "wet" else ("💩 Грязный" if type == "dirty" else "💧+💩 Смешанный")
     db_log_event(0, f"{user} (Виджет)", "diaper", d_name)
     broadcast_message(f"👶 <b>Виджет iPhone ({user}):</b> Смена подгузника — {d_name} в {now_time}.")
@@ -1232,8 +1243,8 @@ def reminder_worker():
 
     while True:
         try:
-            now = datetime.datetime.now()
-            today_date = now.date()
+            now = msk_now()
+            today_date = msk_today()
             today_date_str = str(today_date)
             time_now_str = now.strftime("%H:%M")
 
