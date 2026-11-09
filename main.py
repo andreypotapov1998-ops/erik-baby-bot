@@ -363,12 +363,15 @@ def process_voice_or_text_with_ai(audio_bytes=None, text_content=None, user_name
         if text_content:
             db_log_memory(user_name, text_content, text_content, "", text_content)
             return (
-                f"📝 <b>Заметка сохранена (без AI-анализа):</b>\n\n"
-                f"«{text_content}»\n\n"
-                f"💡 <i>Добавьте ключ GEMINI_API_KEY в Render, чтобы включить расшифровку аудио нейросетью!</i>"
+                f"📝 <b>Заметка сохранена в дневник:</b>\n\n"
+                f"«{text_content}»"
             )
         else:
-            return "❌ Чтобы бот мог расшифровывать голосовые сообщения, добавьте переменную <code>GEMINI_API_KEY</code> в настройках сервиса на Render."
+            db_log_memory(user_name, "[Голосовое сообщение]", "[Голосовое сообщение сохранено]", "", "[Голосовое сообщение]")
+            return (
+                "🎙️ <b>Голосовая заметка сохранена в дневник памяти!</b>\n\n"
+                "💡 <i>Чтобы нейросеть расшифровывала речь в структурированный текст, добавьте бесплатный ключ GEMINI_API_KEY на Render (получить за 30 сек на aistudio.google.com).</i>"
+            )
 
     prompt = (
         "Ты — заботливый персональный семейный ассистент и биограф малыша Эрика (новорождённый). "
@@ -384,7 +387,6 @@ def process_voice_or_text_with_ai(audio_bytes=None, text_content=None, user_name
         "Отвечай красиво оформленным текстом с эмодзи в формате HTML (используй <b>жирный</b>, без markdown-звёздочек)."
     )
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={key}"
     parts = [{"text": prompt}]
     if audio_bytes:
         b64_audio = base64.b64encode(audio_bytes).decode("utf-8")
@@ -398,19 +400,38 @@ def process_voice_or_text_with_ai(audio_bytes=None, text_content=None, user_name
         parts.append({"text": f"Текст сообщения от {user_name}:\n{text_content}"})
 
     payload = {"contents": [{"parts": parts}]}
-    try:
-        r = requests.post(url, json=payload, timeout=45)
-        res_json = r.json()
-        if "candidates" in res_json and res_json["candidates"]:
-            ai_text = res_json["candidates"][0]["content"]["parts"][0]["text"]
-            ai_text = ai_text.replace("**", "<b>").replace("<b></b>", "")
-            db_log_memory(user_name, text_content or "[Голосовое сообщение]", ai_text, "", ai_text)
-            return ai_text
-        else:
-            err = res_json.get("error", {}).get("message", "Неизвестная ошибка")
-            return f"⚠️ Ошибка нейросети: {err}"
-    except Exception as e:
-        return f"⚠️ Ошибка обработки: {e}"
+    
+    # Try models in order of availability
+    models_to_try = [
+        "gemini-2.5-flash",
+        "gemini-1.5-flash",
+        "gemini-flash-latest",
+        "gemini-2.0-flash",
+        "gemini-pro-latest"
+    ]
+    last_err = ""
+    for model_name in models_to_try:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={key}"
+        try:
+            r = requests.post(url, json=payload, timeout=40)
+            if r.status_code == 200:
+                res_json = r.json()
+                if "candidates" in res_json and res_json["candidates"]:
+                    ai_text = res_json["candidates"][0]["content"]["parts"][0]["text"]
+                    ai_text = ai_text.replace("**", "<b>").replace("<b></b>", "")
+                    db_log_memory(user_name, text_content or "[Голосовое сообщение]", ai_text, "", ai_text)
+                    return ai_text
+            else:
+                last_err = f"HTTP {r.status_code}"
+        except Exception as e:
+            last_err = str(e)
+
+    # Fallback if network or quota issue: still save the memory!
+    db_log_memory(user_name, text_content or "[Голосовое сообщение]", "[Голосовая заметка]", "", last_err)
+    return (
+        f"🎙️ <b>Голосовая запись сохранена в хронику дневника!</b>\n\n"
+        f"<i>(Нейросеть временно формирует ответ: {last_err}. Запись не потерялась и сохранена в базе!)</i>"
+    )
 
 def get_main_keyboard():
     return {
@@ -831,19 +852,30 @@ def handle_message(msg):
     if "voice" in msg or "audio" in msg:
         file_obj = msg.get("voice") or msg.get("audio")
         file_id = file_obj.get("file_id")
-        tg_send("sendMessage", {"chat_id": chat_id, "text": "🎙️ <i>Слушаю голосовое сообщение и раскладываю всё по полочкам...</i>", "parse_mode": "HTML"})
+        duration = file_obj.get("duration", 0)
+        dur_str = f" ({duration} сек)" if duration else ""
+        tg_send("sendMessage", {
+            "chat_id": chat_id,
+            "text": f"🎙️ <i>Слушаю голосовое сообщение{dur_str} и раскладываю всё по полочкам...</i>",
+            "parse_mode": "HTML"
+        })
         
         file_info = tg_send("getFile", {"file_id": file_id})
         if file_info and file_info.get("ok"):
             file_path = file_info["result"]["file_path"]
             download_url = FILE_URL + file_path
             try:
-                audio_bytes = requests.get(download_url, timeout=30).content
+                audio_bytes = requests.get(download_url, timeout=40).content
                 ai_summary = process_voice_or_text_with_ai(audio_bytes=audio_bytes, user_name=user_name)
                 response_text = f"📖 <b>Дневник малыша Эрика (Новая запись от {user_name}):</b>\n\n{ai_summary}"
-                broadcast_message(response_text)
+                # Send to sender directly first
+                tg_send("sendMessage", {"chat_id": chat_id, "text": response_text, "parse_mode": "HTML"})
+                # Then notify other subscribers
+                broadcast_message(response_text, exclude_chat_id=chat_id)
             except Exception as e:
-                tg_send("sendMessage", {"chat_id": chat_id, "text": f"⚠️ Не удалось загрузить аудио: {e}"})
+                tg_send("sendMessage", {"chat_id": chat_id, "text": f"⚠️ Ошибка обработки аудио: {e}"})
+        else:
+            tg_send("sendMessage", {"chat_id": chat_id, "text": "⚠️ Не удалось получить аудиофайл от серверов Telegram."})
         return
 
     if text.startswith("/start") or text.startswith("/tutorial") or text == "🎓 Обучение":
@@ -1097,6 +1129,79 @@ async def alice_webhook(request: Request):
 def health():
     return {"status": "ok", "app": "ErikBabyTracker", "time": datetime.datetime.now().isoformat()}
 
+@app.get("/ping")
+def ping():
+    return {"status": "ok", "pong": time.time()}
+
+# --- TELEGRAM WEBHOOK (Wakes up Render instantly on any message) ---
+@app.post("/telegram")
+async def telegram_webhook(request: Request):
+    try:
+        data = await request.json()
+        if "message" in data:
+            handle_message(data["message"])
+        elif "callback_query" in data:
+            handle_callback(data["callback_query"])
+    except Exception as e:
+        print(f"Telegram webhook error: {e}")
+    return {"ok": True}
+
+# --- REST API FOR IPHONE WIDGETS & SHORTCUTS (Команды iOS) ---
+@app.get("/api/feed")
+def api_feed(user: str = "Родитель", ml: int = 90, breast: str = ""):
+    now_time = datetime.datetime.now().strftime("%H:%M")
+    val_name = f"🤱 Грудь ({breast})" if breast else f"🍼 Смесь {ml} мл"
+    db_log_event(0, f"{user} (Виджет)", "feed", val_name, str(ml) if ml else "")
+    feed_int = float((db_get_state("feed_interval_hours") or ["3.0"])[0])
+    next_t = (datetime.datetime.now() + datetime.timedelta(hours=feed_int)).strftime("%H:%M")
+    announcement = (
+        f"🍼 <b>Виджет iPhone ({user}):</b> {val_name} в {now_time}.\n"
+        f"⏳ Следующее кормление ориентировочно в ~{next_t}."
+    )
+    broadcast_message(announcement)
+    return {"status": "ok", "action": "feed", "value": val_name, "next_feed": next_t}
+
+@app.get("/api/sleep")
+def api_sleep(user: str = "Родитель", action: str = "toggle"):
+    now_time = datetime.datetime.now().strftime("%H:%M")
+    sleep_state = db_get_state("is_sleeping")
+    is_sleeping = sleep_state and sleep_state[0] == "1"
+    if action == "wake" or (action == "toggle" and is_sleeping):
+        db_set_state("is_sleeping", "0")
+        last_sleep = db_get_last_event("sleep", "Уснул")
+        dur_str = f" Поспал {format_time_diff(last_sleep[0]).replace(' назад', '')}." if last_sleep else ""
+        db_log_event(0, f"{user} (Виджет)", "sleep", "Проснулся", dur_str)
+        broadcast_message(f"☀️ <b>Виджет iPhone ({user}):</b> Эрик <b>проснулся!</b> в {now_time}.{dur_str}")
+        return {"status": "ok", "state": "awake", "time": now_time}
+    else:
+        db_set_state("is_sleeping", "1")
+        db_log_event(0, f"{user} (Виджет)", "sleep", "Уснул")
+        broadcast_message(f"😴 <b>Виджет iPhone ({user}):</b> Эрик <b>уснул 💤</b> в {now_time}.")
+        return {"status": "ok", "state": "sleeping", "time": now_time}
+
+@app.get("/api/diaper")
+def api_diaper(user: str = "Родитель", type: str = "wet"):
+    now_time = datetime.datetime.now().strftime("%H:%M")
+    d_name = "💧 Мокрый" if type == "wet" else ("💩 Грязный" if type == "dirty" else "💧+💩 Смешанный")
+    db_log_event(0, f"{user} (Виджет)", "diaper", d_name)
+    broadcast_message(f"👶 <b>Виджет iPhone ({user}):</b> Смена подгузника — {d_name} в {now_time}.")
+    return {"status": "ok", "action": "diaper", "value": d_name}
+
+@app.get("/api/status")
+def api_status():
+    age_str = get_erik_age_str()
+    sleep_state = db_get_state("is_sleeping")
+    is_sleeping = sleep_state and sleep_state[0] == "1"
+    last_feed = db_get_last_event("feed")
+    feed_str = f"{last_feed[0].split()[1][:5]} ({last_feed[4]} мл)" if last_feed else "нет"
+    return {
+        "status": "ok",
+        "age": age_str,
+        "is_sleeping": is_sleeping,
+        "state_text": "Спит" if is_sleeping else "Бодрствует",
+        "last_feed": feed_str
+    }
+
 @app.get("/export.xlsx")
 def export_excel():
     excel_bytes = generate_excel_bytes()
@@ -1219,7 +1324,15 @@ def reminder_worker():
 @app.on_event("startup")
 def startup():
     init_db()
-    threading.Thread(target=tg_polling_worker, daemon=True).start()
+    # Auto-register Telegram Webhook so Telegram immediately wakes up Render
+    try:
+        wh_url = "https://erik-baby-bot.onrender.com/telegram"
+        r = requests.post(f"{API_URL}setWebhook", json={"url": wh_url}, timeout=10)
+        print("Webhook set response:", r.json())
+    except Exception as e:
+        print("Failed to set webhook, falling back to polling:", e)
+        threading.Thread(target=tg_polling_worker, daemon=True).start()
+
     threading.Thread(target=reminder_worker, daemon=True).start()
     print("Erik Baby Tracker & Alice Skill service started!")
 
