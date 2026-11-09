@@ -7,7 +7,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "9030754644:AAHxX2fIejBORcD15LJTMtmz4QLlXEr9iqk")
-GEMINI_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_KEY = os.getenv("GEMINI_API_KEY", "AQ.Ab8RN6IMaP_hPyqTMZCsl8wCINItMLzk0ymb0ylha8QBSUyY5Q")
 API_URL = f"https://api.telegram.org/bot{TOKEN}/"
 FILE_URL = f"https://api.telegram.org/file/bot{TOKEN}/"
 DB_PATH = os.path.join(os.path.dirname(__file__), "erik_tracker.db")
@@ -412,13 +412,12 @@ def process_voice_or_text_with_ai(audio_bytes=None, text_content=None, user_name
 
     payload = {"contents": [{"parts": parts}]}
     
-    # Try models in order of availability
+    # Try modern Flash models with active quota
     models_to_try = [
-        "gemini-2.5-flash",
-        "gemini-1.5-flash",
-        "gemini-flash-latest",
-        "gemini-2.0-flash",
-        "gemini-pro-latest"
+        "gemini-3.5-flash",
+        "gemini-3.5-flash-lite",
+        "gemini-3.1-flash-lite",
+        "gemini-3.8-flash"
     ]
     last_err = ""
     for model_name in models_to_try:
